@@ -19,61 +19,96 @@ client = MongoClient(os.getenv("MONGO_URI"), tlsCAFile=certifi.where())
 db = client["venture_alpha"]
 collection = db["signals"]
 
-# ── Weights (must sum to 1.0) ──────────────────
-W_STAR_VELOCITY          = 0.40
-W_CONTRIBUTOR_DIVERSITY  = 0.30
-W_SOCIAL_SENTIMENT       = 0.20
-W_NEWS_MENTIONS          = 0.10
+
+W_DEVELOPER_ACTIVITY  = 0.25  
+W_MARKET_DEMAND       = 0.25   
+W_COMMUNITY_INTEREST  = 0.20   
+W_MEDIA_PRESENCE      = 0.20   
+W_STARTUP_ACTIVITY    = 0.10   
 INVESTMENT_LEAD_THRESHOLD = 0.85
 
 SOURCE_WEIGHTS = {
-    "github":      1.0,   # most reliable — real code activity
-    "hackernews":  0.8,   # developer discussion, high signal
-    "exa":         0.6,   # news/articles, useful but noisier
+    "github":        1.0,   
+    "hackernews":    0.8,   
+    "producthunt":   0.9,  
+    "google_trends": 0.7,   
+    "newsapi":       0.75,  
+    "exa":           0.6,   
 }
 
 
 def apply_source_weight(score: float, source: str) -> float:
     """
     Multiply the raw conviction score by a source trust factor.
-    GitHub signals are taken at full value; Exa signals are slightly discounted.
     """
     weight = SOURCE_WEIGHTS.get(source, 0.7)
     return round(score * weight, 4)
 
 
-def get_news_mentions_score(tags) -> float:
+def score_developer_activity(row) -> float:
     """
-    Member 1 provides a 'tags' array on every document.
-    We use the number of relevant VC/tech tags as a proxy
-    for news coverage until a dedicated news_mentions collection exists.
-
-    High-signal tags get a boost.
-    Score is normalized to 0.0 - 1.0, capped at 1.0.
+    Pillar 1: Developer Activity (GitHub-centric)
+    0.7 × star_velocity_norm + 0.3 × contributor_diversity
     """
-    if not tags or not isinstance(tags, list):
-        return 0.3   # low default
-
-    high_signal_tags = {
-        "AI", "agents", "LLM", "vector-database", "YCombinator",
-        "open-source", "autonomous", "infrastructure", "startup"
-    }
-
-    # Count how many of this doc's tags are high-signal
-    matches = sum(1 for tag in tags if tag in high_signal_tags)
-    return round(min(matches / 3.0, 1.0), 4)   # 3 matches = full score
+    sv = float(row.get("star_velocity_norm", 0))
+    cd = float(row.get("contributor_diversity", 0))
+    return round(0.7 * sv + 0.3 * cd, 4)
 
 
-def calculate_conviction_score(sv_norm, diversity, sentiment, news) -> float:
+def score_market_demand(row) -> float:
     """
-    CS = 0.4×star_velocity_norm + 0.3×diversity + 0.2×sentiment + 0.1×news
+    Pillar 2: Market Demand (Google Trends)
+    0.6 × trend_score_norm + 0.4 × trend_growth_norm
+    """
+    ts = float(row.get("trend_score_norm", 0))
+    tg = float(row.get("trend_growth_norm", 0))
+    return round(0.6 * ts + 0.4 * tg, 4)
+
+
+def score_community_interest(row) -> float:
+    """
+    Pillar 3: Community Interest (Product Hunt)
+    0.7 × ph_votes_norm + 0.3 × ph_engagement
+    """
+    pv = float(row.get("ph_votes_norm", 0))
+    pe = float(row.get("ph_engagement", 0))
+    return round(0.7 * pv + 0.3 * pe, 4)
+
+
+def score_media_presence(row) -> float:
+    """
+    Pillar 4: Media Presence (NewsAPI)
+    0.5 × news_mentions_norm + 0.5 × media_sentiment
+    """
+    nm = float(row.get("news_mentions_norm", 0))
+    ms = float(row.get("media_sentiment", 0))
+    return round(0.5 * nm + 0.5 * ms, 4)
+
+
+def score_startup_activity(row) -> float:
+    """
+    Pillar 5: Startup Activity (composite proxy — no Crunchbase)
+    Uses trend momentum + community engagement as a proxy for
+    startup traction. 0.5 × trend_growth_norm + 0.5 × ph_engagement
+    """
+    tg = float(row.get("trend_growth_norm", 0))
+    pe = float(row.get("ph_engagement", 0))
+    return round(0.5 * tg + 0.5 * pe, 4)
+
+
+def calculate_conviction_score(dev, market, community, media, startup) -> float:
+    """
+    CS = 0.25×developer_activity + 0.25×market_demand
+       + 0.20×community_interest + 0.20×media_presence
+       + 0.10×startup_activity
     All inputs and output: 0.0 to 1.0
     """
     score = (
-        W_STAR_VELOCITY         * float(sv_norm)
-        + W_CONTRIBUTOR_DIVERSITY * float(diversity)
-        + W_SOCIAL_SENTIMENT      * float(sentiment)
-        + W_NEWS_MENTIONS         * float(news)
+        W_DEVELOPER_ACTIVITY  * float(dev)
+        + W_MARKET_DEMAND     * float(market)
+        + W_COMMUNITY_INTEREST * float(community)
+        + W_MEDIA_PRESENCE    * float(media)
+        + W_STARTUP_ACTIVITY  * float(startup)
     )
     return round(score, 4)
 
@@ -81,8 +116,7 @@ def calculate_conviction_score(sv_norm, diversity, sentiment, news) -> float:
 def save_scores_to_mongo(df: pd.DataFrame):
     """
     Write scores back into MongoDB.
-    Member 1 uses 'url' as the unique primary key, so we match on that.
-    update_one with upsert=False — we only update existing docs, never insert new ones.
+    Match on 'url' as primary key.  Persist all 5 pillar scores.
     """
     updated = 0
     skipped = 0
@@ -97,10 +131,17 @@ def save_scores_to_mongo(df: pd.DataFrame):
             {"$set": {
                 "conviction_score":       float(row["conviction_score"]),
                 "is_investment_lead":     bool(row["is_investment_lead"]),
-                "social_sentiment":       float(row["social_sentiment"]),
-                "star_velocity":          float(row["star_velocity"]),
-                "contributor_diversity":  float(row["contributor_diversity"]),
-                "star_velocity_norm":     float(row["star_velocity_norm"]),
+                # Pillar scores
+                "developer_activity":     float(row.get("developer_activity", 0)),
+                "market_demand":          float(row.get("market_demand", 0)),
+                "community_interest":     float(row.get("community_interest", 0)),
+                "media_presence":         float(row.get("media_presence", 0)),
+                "startup_activity":       float(row.get("startup_activity", 0)),
+                # Legacy fields kept for backward compat
+                "social_sentiment":       float(row.get("social_sentiment", 0)),
+                "star_velocity":          float(row.get("star_velocity", 0)),
+                "contributor_diversity":  float(row.get("contributor_diversity", 0)),
+                "star_velocity_norm":     float(row.get("star_velocity_norm", 0)),
             }},
             upsert=False
         )
@@ -124,39 +165,52 @@ def run_full_pipeline():
 
     print(f"Fetched {len(df)} signals from MongoDB Atlas.")
 
-    # 2. Metrics
+    # 2. Metrics (now includes multi-source extraction)
     df = process_all_metrics(df)
 
     # 3. Sentiment
     df = run_sentiment_pipeline(df)
 
-    # 4. Conviction scores
-    scores, flags = [], []
+    # 4. Compute 5-pillar scores
+    pillar_scores = {"developer_activity": [], "market_demand": [],
+                     "community_interest": [], "media_presence": [],
+                     "startup_activity": []}
+    conviction_scores = []
+    flags = []
+
     for _, row in df.iterrows():
-        news = get_news_mentions_score(row.get("tags", []))
+        dev     = score_developer_activity(row)
+        market  = score_market_demand(row)
+        comm    = score_community_interest(row)
+        media   = score_media_presence(row)
+        startup = score_startup_activity(row)
+
         cs = apply_source_weight(
-            calculate_conviction_score(
-                row["star_velocity_norm"],
-                row["contributor_diversity"],
-                row["social_sentiment"],
-                news
-            ),
+            calculate_conviction_score(dev, market, comm, media, startup),
             row.get("source", "exa")
         )
-        scores.append(cs)
+
+        pillar_scores["developer_activity"].append(dev)
+        pillar_scores["market_demand"].append(market)
+        pillar_scores["community_interest"].append(comm)
+        pillar_scores["media_presence"].append(media)
+        pillar_scores["startup_activity"].append(startup)
+        conviction_scores.append(cs)
         flags.append(cs >= INVESTMENT_LEAD_THRESHOLD)
 
-    df["conviction_score"]    = scores
-    df["is_investment_lead"]  = flags
+    for col, vals in pillar_scores.items():
+        df[col] = vals
+    df["conviction_score"]   = conviction_scores
+    df["is_investment_lead"] = flags
 
     # 5. Print ranked results
     print("\n" + "=" * 55)
     print("CONVICTION SCORE RESULTS (top 10)")
     print("=" * 55)
 
-    display_cols = ["repo_name", "source", "star_velocity",
-                    "social_sentiment", "conviction_score", "is_investment_lead"]
-    # Only use columns that actually exist
+    display_cols = ["repo_name", "source", "developer_activity", "market_demand",
+                    "community_interest", "media_presence", "startup_activity",
+                    "conviction_score", "is_investment_lead"]
     display_cols = [c for c in display_cols if c in df.columns]
 
     top = df[display_cols] \
