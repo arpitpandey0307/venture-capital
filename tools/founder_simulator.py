@@ -7,14 +7,14 @@ Two-stage pipeline:
   Pass 1 → Gemini generates 5 probing investor questions
   Pass 2 → Gemini simulates founder responses using repo context
 
-Uses the new google.genai SDK.
+Includes retry logic with fallback at every stage.
 """
 
 import json
 import logging
 from typing import Dict, Any, List
 
-from google import genai
+import google.generativeai as genai
 
 from config import settings
 from models.schemas import InterviewOutput
@@ -22,20 +22,25 @@ from utils.prompt_templates import (
     founder_interview_questions_prompt,
     founder_interview_answers_prompt
 )
+from utils.resilience import (
+    call_llm_with_retry,
+    strip_markdown_fences,
+    safe_get,
+)
 
 logger = logging.getLogger(__name__)
 
-# Initialise the new google.genai client
-_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+# Configure the Gemini SDK with the API key
+genai.configure(api_key=settings.GEMINI_API_KEY)
+_model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
 
-def _call_gemini(prompt: str) -> str:
-    """Call Gemini and return raw text response."""
-    response = _client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt
-    )
-    return response.text.strip()
+def _call_llm(prompt: str) -> str:
+    """Call Gemini Flash with retry. Returns empty string on total failure."""
+    result, err = call_llm_with_retry(_model, prompt)
+    if result is None:
+        logger.warning(f"Founder Simulator LLM failed: {err}")
+    return result if result is not None else ""
 
 
 def _parse_json_list(raw: str, key: str) -> List[str]:
@@ -43,13 +48,10 @@ def _parse_json_list(raw: str, key: str) -> List[str]:
     Safely parse a JSON object and extract a list under `key`.
     Handles markdown-fenced responses from Gemini.
     """
-    text = raw.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        text = parts[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.strip()
+    if not raw:
+        return []
+
+    text = strip_markdown_fences(raw)
 
     try:
         data = json.loads(text)
@@ -71,14 +73,15 @@ def simulate_founder_interview(repo_analysis: Dict[str, Any]) -> InterviewOutput
     Returns:
         InterviewOutput with matched questions and answers lists.
     """
-    repo_name = repo_analysis.get("repo_name", "Unknown Project")
+    repo_name = safe_get(repo_analysis, "repo_name", "Unknown Project")
     logger.info(f"Simulating founder interview for: {repo_name}")
 
     # ── Pass 1: Generate Questions ────────────────────────────────────────────
-    q_raw = _call_gemini(founder_interview_questions_prompt(repo_analysis))
+    q_raw = _call_llm(founder_interview_questions_prompt(repo_analysis))
     questions = _parse_json_list(q_raw, "questions")
 
     if not questions:
+        logger.warning("Question generation failed — using default questions.")
         questions = [
             f"What core problem does {repo_name} solve that existing tools cannot?",
             "What is your primary competitive moat?",
@@ -88,8 +91,18 @@ def simulate_founder_interview(repo_analysis: Dict[str, Any]) -> InterviewOutput
         ]
 
     # ── Pass 2: Simulate Founder Answers ─────────────────────────────────────
-    a_raw = _call_gemini(founder_interview_answers_prompt(repo_analysis, questions))
+    a_raw = _call_llm(founder_interview_answers_prompt(repo_analysis, questions))
     answers = _parse_json_list(a_raw, "answers")
+
+    if not answers:
+        logger.warning("Answer generation failed — using fallback answers.")
+        answers = [
+            f"{repo_name} addresses a critical gap in the current tooling landscape.",
+            "Our moat is built on deep technical expertise and community trust.",
+            "We plan a freemium model with enterprise support tiers.",
+            "Our initial target is developer-first startups and mid-market tech companies.",
+            "We see this becoming the industry standard within 3-5 years."
+        ]
 
     # Align both lists to the same length
     max_len = max(len(questions), len(answers))

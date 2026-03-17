@@ -7,9 +7,12 @@ Design principles:
   • Each builder function accepts typed arguments and returns a plain str.
   • Prompts are explicit and structured so Gemini returns predictable outputs.
   • All prompts instruct the model to stay factual and concise (hackathon-safe).
+  • All user-supplied fields are sanitized and truncated before interpolation.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
+
+from utils.resilience import safe_get, sanitize_input, truncate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -26,17 +29,23 @@ def technology_analysis_prompt(repo_data: Dict[str, Any]) -> str:
     Returns:
         Formatted prompt string.
     """
+    name  = sanitize_input(safe_get(repo_data, "repo_name", "Unknown"))
+    desc  = truncate(sanitize_input(safe_get(repo_data, "description", "N/A")), 500)
+    stars = safe_get(repo_data, "stars", 0)
+    contribs = safe_get(repo_data, "contributors", 0)
+    velocity = safe_get(repo_data, "star_velocity", 0)
+
     return f"""
 You are a senior technology analyst at a top venture capital firm.
 
 Analyse the following open-source repository and provide a structured assessment.
 
 Repository Details:
-  - Name        : {repo_data.get('repo_name', 'Unknown')}
-  - Description : {repo_data.get('description', 'N/A')}
-  - GitHub Stars: {repo_data.get('stars', 0):,}
-  - Contributors: {repo_data.get('contributors', 0)}
-  - Star Velocity (stars/day): {repo_data.get('star_velocity', 0)}
+  - Name        : {name}
+  - Description : {desc}
+  - GitHub Stars: {stars:,}
+  - Contributors: {contribs}
+  - Star Velocity (stars/day): {velocity}
 
 Respond in EXACTLY this JSON format (no markdown fences, pure JSON):
 {{
@@ -63,6 +72,11 @@ def trend_validation_prompt(metrics: Dict[str, Any]) -> str:
     Returns:
         Formatted prompt string.
     """
+    velocity  = safe_get(metrics, "star_velocity", 0)
+    contribs  = safe_get(metrics, "contributors", 0)
+    sentiment = sanitize_input(str(safe_get(metrics, "social_sentiment", "neutral")))
+    mentions  = safe_get(metrics, "news_mentions", 0)
+
     return f"""
 You are a venture capital trend analyst specialising in emerging technologies.
 
@@ -70,10 +84,10 @@ Evaluate the following project signals and determine the strength of the
 technology trend this project represents.
 
 Signals:
-  - Star Velocity (stars added per day) : {metrics.get('star_velocity', 0)}
-  - Number of Contributors              : {metrics.get('contributors', 0)}
-  - Social Sentiment                    : {metrics.get('social_sentiment', 'neutral')}
-  - News / Blog Mentions (recent)       : {metrics.get('news_mentions', 0)}
+  - Star Velocity (stars added per day) : {velocity}
+  - Number of Contributors              : {contribs}
+  - Social Sentiment                    : {sentiment}
+  - News / Blog Mentions (recent)       : {mentions}
 
 Trend Strength Criteria:
   High   → Rapidly growing community, positive sentiment, multiple news mentions
@@ -103,14 +117,19 @@ def founder_interview_questions_prompt(repo_analysis: Dict[str, Any]) -> str:
     Returns:
         Formatted prompt string.
     """
+    name     = sanitize_input(safe_get(repo_analysis, "repo_name", "Unknown"))
+    tech     = truncate(sanitize_input(safe_get(repo_analysis, "technology_summary", "")), 500)
+    uses     = truncate(sanitize_input(safe_get(repo_analysis, "key_use_cases", "")), 500)
+    impact   = truncate(sanitize_input(safe_get(repo_analysis, "industry_impact", "")), 500)
+
     return f"""
 You are a Partner at a top-tier venture capital firm conducting a first-meeting
 due diligence call with the founders of the following project:
 
-Project: {repo_analysis.get('repo_name', 'Unknown')}
-Technology Summary: {repo_analysis.get('technology_summary', '')}
-Key Use Cases: {repo_analysis.get('key_use_cases', '')}
-Industry Impact: {repo_analysis.get('industry_impact', '')}
+Project: {name}
+Technology Summary: {tech}
+Key Use Cases: {uses}
+Industry Impact: {impact}
 
 Generate exactly 5 sharp, probing VC due-diligence questions covering:
   1. The core problem being solved
@@ -134,7 +153,7 @@ Respond in EXACTLY this JSON format (no markdown fences, pure JSON):
 
 def founder_interview_answers_prompt(
     repo_analysis: Dict[str, Any],
-    questions: list
+    questions: List[str]
 ) -> str:
     """
     Prompt: simulate founder answers to the given VC questions.
@@ -146,16 +165,24 @@ def founder_interview_answers_prompt(
     Returns:
         Formatted prompt string.
     """
+    name   = sanitize_input(safe_get(repo_analysis, "repo_name", "this project"))
+    tech   = truncate(sanitize_input(safe_get(repo_analysis, "technology_summary", "")), 500)
+    uses   = truncate(sanitize_input(safe_get(repo_analysis, "key_use_cases", "")), 500)
+    impact = truncate(sanitize_input(safe_get(repo_analysis, "industry_impact", "")), 500)
+
+    # Sanitize each question too
+    safe_questions = [sanitize_input(truncate(q, 300)) for q in questions]
     questions_text = "\n".join(
-        f"  Q{i+1}: {q}" for i, q in enumerate(questions)
+        f"  Q{i+1}: {q}" for i, q in enumerate(safe_questions)
     )
+
     return f"""
-You are the founder of {repo_analysis.get('repo_name', 'this project')}.
+You are the founder of {name}.
 
 Project context:
-  Technology: {repo_analysis.get('technology_summary', '')}
-  Use Cases : {repo_analysis.get('key_use_cases', '')}
-  Industries: {repo_analysis.get('industry_impact', '')}
+  Technology: {tech}
+  Use Cases : {uses}
+  Industries: {impact}
 
 Answer the following VC questions as the founder. Be confident, specific,
 and data-driven. Each answer should be 2-4 sentences.
@@ -189,6 +216,18 @@ def investment_memo_prompt(project_data: Dict[str, Any]) -> str:
     Returns:
         Formatted prompt string.
     """
+    name      = sanitize_input(safe_get(project_data, "repo_name", "Unknown"))
+    desc      = truncate(sanitize_input(safe_get(project_data, "description", "")), 500)
+    stars     = safe_get(project_data, "stars", 0)
+    contribs  = safe_get(project_data, "contributors", 0)
+    velocity  = safe_get(project_data, "star_velocity", 0)
+    sentiment = sanitize_input(str(safe_get(project_data, "social_sentiment", "neutral")))
+    mentions  = safe_get(project_data, "news_mentions", 0)
+    trend     = sanitize_input(safe_get(project_data, "trend_strength", "Unknown"))
+    conv      = safe_get(project_data, "conviction_score", 0)
+    tech_sum  = truncate(sanitize_input(safe_get(project_data, "technology_summary", "")), 800)
+    research  = truncate(sanitize_input(safe_get(project_data, "research_summary", "")), 800)
+
     return f"""
 You are a Managing Partner at a top venture capital firm.
 
@@ -196,21 +235,21 @@ Write a professional investment memo for the following project.
 The memo will be shared with the investment committee.
 
 Project Data:
-  - Repository      : {project_data.get('repo_name', 'Unknown')}
-  - Description     : {project_data.get('description', '')}
-  - GitHub Stars    : {project_data.get('stars', 0):,}
-  - Contributors    : {project_data.get('contributors', 0)}
-  - Star Velocity   : {project_data.get('star_velocity', 0)} stars/day
-  - Social Sentiment: {project_data.get('social_sentiment', 'neutral')}
-  - News Mentions   : {project_data.get('news_mentions', 0)}
-  - Trend Strength  : {project_data.get('trend_strength', 'Unknown')}
-  - Conviction Score: {project_data.get('conviction_score', 0):.2f} / 1.00
+  - Repository      : {name}
+  - Description     : {desc}
+  - GitHub Stars    : {stars:,}
+  - Contributors    : {contribs}
+  - Star Velocity   : {velocity} stars/day
+  - Social Sentiment: {sentiment}
+  - News Mentions   : {mentions}
+  - Trend Strength  : {trend}
+  - Conviction Score: {conv:.2f} / 1.00
 
 Technology Analysis:
-  {project_data.get('technology_summary', '')}
+  {tech_sum}
 
 Research Insights:
-  {project_data.get('research_summary', '')}
+  {research}
 
 Write the memo with EXACTLY these five sections:
 

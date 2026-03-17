@@ -56,7 +56,7 @@ from tools.research_tool import research_technology
 from tools.founder_simulator import simulate_founder_interview
 from agents.trend_agent import validate_trend
 from agents.memo_agent import generate_investment_memo, compute_signal_breakdown
-from services.analysis_service import run_full_pipeline, compare_projects
+from services.analysis_service import run_full_pipeline, compare_projects, get_emerging_projects, seed_demo_projects
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -323,4 +323,50 @@ def endpoint_compare_projects(body: CompareProjectsInput) -> CompareProjectsOutp
         return compare_projects(body.repo1.model_dump(), body.repo2.model_dump())
     except Exception as e:
         logger.error(f"compare_projects failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 8: EMERGING PROJECTS FROM MONGODB
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/emerging_projects",
+    tags=["MongoDB"],
+    summary="Fetch top emerging projects from MongoDB signals collection",
+    description=(
+        "Reads the 'signals' collection in MongoDB, sorts by conviction_score "
+        "descending, and returns the top-N projects. Requires MONGO_URI to be set."
+    )
+)
+def endpoint_emerging_projects(limit: int = 10):
+    try:
+        logger.info(f"GET /emerging_projects — limit={limit}")
+        projects = get_emerging_projects(limit=limit)
+        return {"count": len(projects), "projects": projects}
+    except Exception as e:
+        logger.error(f"emerging_projects failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 9: SEED DEMO DATA INTO MONGODB
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/seed_data",
+    tags=["MongoDB"],
+    summary="Seed the 5 demo projects into MongoDB signals collection",
+    description=(
+        "Upserts the 5 canonical demo projects into MongoDB with computed "
+        "conviction scores. Call this once to bootstrap /emerging_projects "
+        "before any real analysis runs have been saved."
+    )
+)
+def endpoint_seed_data():
+    try:
+        logger.info("POST /seed_data — seeding demo projects into MongoDB")
+        result = seed_demo_projects()
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.error(f"seed_data failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

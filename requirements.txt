@@ -7,3 +7,4 @@ exa-py
 pydantic
 python-dotenv
 requests
+pymongo

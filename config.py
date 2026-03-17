@@ -1,43 +1,44 @@
-"""
-config.py
----------
-Centralised configuration loader for Venture-Alpha AI module.
-Reads API keys and settings from environment variables (via .env file).
-"""
-
 import os
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
-# Load variables from .env file into the environment
 load_dotenv()
 
-
 class Settings:
-    """Application-wide settings loaded from environment variables."""
 
-    # ── Google Gemini 1.5 Flash ──────────────────────────────────────────────
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.0-flash"   # free-tier model (new google.genai SDK)
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL = "gemini-2.5-flash-lite"
 
-    # ── Exa Search API ───────────────────────────────────────────────────────
-    EXA_API_KEY: str = os.getenv("EXA_API_KEY", "")
-    EXA_NUM_RESULTS: int = 5                  # top-N articles to fetch
+    EXA_API_KEY = os.getenv("EXA_API_KEY")
+    EXA_NUM_RESULTS = 5
 
-    # ── FastAPI app meta ─────────────────────────────────────────────────────
-    APP_TITLE: str = "Venture-Alpha AI Intelligence Layer"
-    APP_VERSION: str = "1.0.0"
-    APP_DESCRIPTION: str = (
+    MONGO_URI = os.getenv("MONGO_URI")
+
+    MONGO_DB_NAME = "venture_alpha"
+    MONGO_COLLECTION_SIGNALS = "signals"
+
+    APP_TITLE = "Venture-Alpha AI Intelligence Layer"
+    APP_VERSION = "1.0.0"
+    APP_DESCRIPTION = (
         "AI reasoning service that transforms structured repository signals "
-        "into investment-grade insights using Gemini 1.5 Flash and Exa Search."
+        "into investment-grade insights using Gemini 2.0 Flash and Exa Search."
     )
 
-    def validate(self) -> None:
-        """Raise if required keys are missing."""
+    def validate(self):
         if not self.GEMINI_API_KEY:
-            raise EnvironmentError("GEMINI_API_KEY is not set in .env")
+            raise Exception("GEMINI_API_KEY missing in .env")
+
         if not self.EXA_API_KEY:
-            raise EnvironmentError("EXA_API_KEY is not set in .env")
+            raise Exception("EXA_API_KEY missing in .env")
+
+        if not self.MONGO_URI:
+            raise Exception("MONGO_URI missing in .env")
 
 
-# Singleton instance used throughout the project
 settings = Settings()
+
+mongo_client = MongoClient(settings.MONGO_URI)
+mongo_db = mongo_client[settings.MONGO_DB_NAME]
+signals_collection = mongo_db[settings.MONGO_COLLECTION_SIGNALS]
+
+print("Gemini key loaded:", settings.GEMINI_API_KEY[:10])

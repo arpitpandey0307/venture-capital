@@ -3,49 +3,38 @@ tools/github_analyzer.py
 ------------------------
 Tool 1 — Repository Technology Analyzer
 
-Uses Gemini 2.0 Flash (google.genai SDK) to analyse a repository's technology.
+Uses Gemini Flash (google.generativeai SDK) to analyse a repository's technology.
+Includes retry logic and fallback responses for robustness.
 """
 
 import json
 import logging
 from typing import Dict, Any
 
-from google import genai
+import google.generativeai as genai
 
 from config import settings
 from models.schemas import TechAnalysisOutput
 from utils.prompt_templates import technology_analysis_prompt
+from utils.resilience import call_llm_with_retry, strip_markdown_fences
 
 logger = logging.getLogger(__name__)
 
-# Initialise the new google.genai client
-_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+# Configure the Gemini SDK with the API key
+genai.configure(api_key=settings.GEMINI_API_KEY)
+_model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
 
-def _call_gemini(prompt: str) -> str:
+def _call_llm(prompt: str) -> str:
     """
-    Call Gemini via the new google.genai SDK and return the raw text response.
-
-    Args:
-        prompt: The prompt string to send.
-
-    Returns:
-        Raw text from Gemini, with markdown fences stripped.
+    Call Gemini Flash with retry logic and return the raw text response.
+    Returns a fallback string if all retries fail.
     """
-    response = _client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt
-    )
-    raw = response.text.strip()
-
-    # Strip markdown code fences if Gemini wraps output in ```json ... ```
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    return raw
+    raw, err = call_llm_with_retry(_model, prompt)
+    if raw is None:
+        safe_err = err.replace('"', "'").replace('\n', ' ')
+        return f'{{"technology_summary":"LLM unavailable — analysis could not be completed. Reason: {safe_err}","key_use_cases":"N/A","industry_impact":"N/A"}}'
+    return strip_markdown_fences(raw)
 
 
 def analyze_repository(repo_data: Dict[str, Any]) -> TechAnalysisOutput:
@@ -62,7 +51,7 @@ def analyze_repository(repo_data: Dict[str, Any]) -> TechAnalysisOutput:
     logger.info(f"Analysing repository: {repo_data.get('repo_name')}")
 
     prompt = technology_analysis_prompt(repo_data)
-    raw_text = _call_gemini(prompt)
+    raw_text = _call_llm(prompt)
 
     try:
         data = json.loads(raw_text)

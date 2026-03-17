@@ -8,21 +8,32 @@ Now returns:
   • conviction_score
   • signal_breakdown (component-level scores)
   • risks (extracted structured risk list)
+
+Includes retry logic on all LLM calls and fallback responses.
 """
 
 import json
 import logging
 from typing import Dict, Any, List
 
-from google import genai
+import google.generativeai as genai
 
 from config import settings
 from models.schemas import MemoOutput, SignalBreakdown
 from utils.prompt_templates import investment_memo_prompt
+from utils.resilience import (
+    call_llm_with_retry,
+    strip_markdown_fences,
+    safe_get,
+    sanitize_input,
+    truncate,
+)
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+# Configure the Gemini SDK with the API key
+genai.configure(api_key=settings.GEMINI_API_KEY)
+_model = genai.GenerativeModel(settings.GEMINI_MODEL)
 
 # ── Normalisation ceilings ────────────────────────────────────────────────────
 MAX_STAR_VELOCITY = 200.0
@@ -34,6 +45,13 @@ SENTIMENT_MAP = {
     "neutral":  0.5,
     "negative": 0.0
 }
+
+# ── Default fallback risks ───────────────────────────────────────────────────
+_FALLBACK_RISKS = [
+    "Technology is still in early-stage development",
+    "Competitive pressure from established frameworks",
+    "Limited enterprise adoption and revenue model uncertainty"
+]
 
 
 def _normalise(value: float, ceiling: float) -> float:
@@ -52,12 +70,12 @@ def compute_signal_breakdown(repo_data: Dict[str, Any]) -> SignalBreakdown:
         developer_sentiment, and media_presence scores.
     """
     return SignalBreakdown(
-        github_velocity=_normalise(float(repo_data.get("star_velocity", 0)), MAX_STAR_VELOCITY),
-        community_strength=_normalise(float(repo_data.get("contributors", 0)), MAX_CONTRIBUTORS),
+        github_velocity=_normalise(float(safe_get(repo_data, "star_velocity", 0)), MAX_STAR_VELOCITY),
+        community_strength=_normalise(float(safe_get(repo_data, "contributors", 0)), MAX_CONTRIBUTORS),
         developer_sentiment=SENTIMENT_MAP.get(
-            str(repo_data.get("social_sentiment", "neutral")).lower(), 0.5
+            str(safe_get(repo_data, "social_sentiment", "neutral")).lower(), 0.5
         ),
-        media_presence=_normalise(float(repo_data.get("news_mentions", 0)), MAX_NEWS_MENTIONS)
+        media_presence=_normalise(float(safe_get(repo_data, "news_mentions", 0)), MAX_NEWS_MENTIONS)
     )
 
 
@@ -81,21 +99,18 @@ def compute_conviction_score(repo_data: Dict[str, Any]) -> float:
 
 def _extract_risks(memo_text: str, repo_data: Dict[str, Any]) -> List[str]:
     """
-    Extract structured risks from the memo text using Gemini.
-
-    Args:
-        memo_text: The generated investment memo.
-        repo_data: Original repo input data.
-
-    Returns:
-        List of 3-5 risk strings.
+    Extract structured risks from the memo text using Gemini (with retry).
+    Falls back to default risks on failure.
     """
+    safe_name = sanitize_input(safe_get(repo_data, "repo_name", "Unknown"))
+    safe_memo = truncate(memo_text, 2000)
+
     prompt = f"""
 You are a risk analyst at a venture capital firm.
 
-Given this investment memo about "{repo_data.get('repo_name', 'Unknown')}":
+Given this investment memo about "{safe_name}":
 
-{memo_text[:2000]}
+{safe_memo}
 
 Extract exactly 3-5 key investment risks. Each risk should be a single
 concise sentence (max 15 words).
@@ -111,28 +126,18 @@ Respond in EXACTLY this JSON format (no markdown fences, pure JSON):
 """.strip()
 
     try:
-        response = _client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt
-        )
-        raw = response.text.strip()
+        raw, err = call_llm_with_retry(_model, prompt)
+        if raw is None:
+            logger.warning(f"LLM unavailable for risk extraction ({err}) — using fallback.")
+            return list(_FALLBACK_RISKS)
 
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
+        raw = strip_markdown_fences(raw)
         data = json.loads(raw)
-        return data.get("risks", [])
+        risks = data.get("risks", [])
+        return risks if risks else list(_FALLBACK_RISKS)
     except Exception as e:
         logger.warning(f"Risk extraction failed: {e}. Using fallback risks.")
-        return [
-            "Technology is still in early-stage development",
-            "Competitive pressure from established frameworks",
-            "Limited enterprise adoption and revenue model uncertainty"
-        ]
+        return list(_FALLBACK_RISKS)
 
 
 def generate_investment_memo(project_data: Dict[str, Any]) -> MemoOutput:
@@ -146,7 +151,7 @@ def generate_investment_memo(project_data: Dict[str, Any]) -> MemoOutput:
     Returns:
         MemoOutput with memo, conviction_score, signal_breakdown, risks.
     """
-    repo_name = project_data.get("repo_name", "Unknown")
+    repo_name = safe_get(project_data, "repo_name", "Unknown")
     logger.info(f"Generating investment memo for: {repo_name}")
 
     # Compute conviction score and signal breakdown
@@ -160,13 +165,19 @@ def generate_investment_memo(project_data: Dict[str, Any]) -> MemoOutput:
     )
     project_data["conviction_score"] = conv_score
 
-    # Generate memo text via Gemini
+    # Generate memo text via Gemini Flash (with retry)
     prompt = investment_memo_prompt(project_data)
-    response = _client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt
-    )
-    memo_text = response.text.strip()
+    memo_text, err = call_llm_with_retry(_model, prompt)
+
+    if memo_text is None:
+        logger.warning(f"LLM unavailable for memo generation ({err}) — using fallback memo.")
+        safe_err = err.replace('\n', ' ')
+        memo_text = (
+            f"## Investment Memo — {repo_name}\n\n"
+            f"AI-generated memo unavailable due to LLM service issues. Reason: {safe_err}. "
+            f"Conviction score: {conv_score:.2f}/1.00. "
+            f"Please retry or review quantitative signals manually."
+        )
 
     # Extract structured risks from the memo
     risks = _extract_risks(memo_text, project_data)
